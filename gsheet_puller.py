@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-# from psycopg2 import connect
+from psycopg2 import connect
 import pygsheets
 import json
 import io
@@ -24,15 +24,23 @@ def get_engine():
 
 
 
-# try:
-#     conn = connect(database=DATABASE,
-#     user=USER_NAME,
-#     password=PASSWORD,
-#     host=HOST)
+try:
+    postgres_config = creds['postgres']
 
-#     print('connected to the DB')
-# except:
-#     print('Not connected')
+    DATABASE = postgres_config['DATABASE']
+    HOST = postgres_config['HOST']
+    USER_NAME = postgres_config['USER'] 
+    PASSWORD = postgres_config['PASS']
+
+    psycop_conn = connect(database=DATABASE,
+    user=USER_NAME,
+    password=PASSWORD,
+    host=HOST)
+    cursor = psycop_conn.cursor()
+
+    print('connected to the DB')
+except:
+    print('Not connected')
 
 def read_gsheet_data():
     gc = pygsheets.authorize(service_file='creds.json')
@@ -49,48 +57,74 @@ def push_data(df):
     df['mobile_no'] = df['mobile_no'].astype(str)
     df['modified_at'] = pd.datetime.now()
 
-    
-    q = '''delete from orders;'''
-    conn.execute(q)
-    print('deleted from orders table')
+    try:
+        q = 'drop table temp_orders;'
+        conn.execute(q)
+        print('dropped temp orders table ...')
+
+        q = 'create table temp_orders as (select * from orders limit 0)'
+        conn.execute(q)
+        print('created temp_orders table ...')
+    except:
+        q = 'create table temp_orders as (select * from orders limit 0)'
+        conn.execute(q)
+        print('created temp_orders table ...')
 
 
+    # pushing data into temp_orders table
     raw_conn = conn.raw_connection()
     cur = raw_conn.cursor()
     output = io.StringIO()
     df.to_csv(output, sep='\t', header=False, index=False)
     output.seek(0)
     contents = output.getvalue()
-    cur.copy_from(output, 'orders') # null values become ''
+    cur.copy_from(output, 'temp_orders') # null values become ''
     raw_conn.commit()
 
+    # deleteing removed ids
+    q = '''delete from orders where id not in (select id from temp_orders);'''
+    cursor.execute(q)
+    psycop_conn.commit()
+    print('deleted from orders table')
 
-    # q='''with data as (SELECT t.*
-    # FROM temp_orders AS t
-    # LEFT JOIN orders o ON o.id = t.id
-    # WHERE (t.first_name<>o.first_name)
-    # OR (t.last_name<>o.last_name)
-    # OR (t.mobile_no<>o.mobile_no)
-    # OR (t.created_at<>o.created_at)
-    # OR (o.id IS NULL))
-    # select * from data'''
+    q = '''WITH DATA AS
+            (SELECT DISTINCT t.id AS id
+            FROM temp_orders AS t
+            LEFT JOIN orders o ON o.id = t.id
+            WHERE (t.first_name<>o.first_name)
+                OR (t.last_name<>o.last_name)
+                OR (t.mobile_no<>o.mobile_no)
+                OR (t.created_at<>o.created_at)
+                OR (o.id IS NULL)
+                )
+            DELETE
+            FROM orders
+            WHERE id IN
+                (SELECT id
+                FROM DATA);'''
+
+    cursor.execute(q)
+    psycop_conn.commit()
+    print('dropped modified columns from orders')
+
+    q='''WITH DATA AS
+        (SELECT t.*
+        FROM temp_orders AS t
+        LEFT JOIN orders o ON o.id = t.id
+        WHERE (t.first_name<>o.first_name)
+            OR (t.last_name<>o.last_name)
+            OR (t.mobile_no<>o.mobile_no)
+            OR (t.created_at<>o.created_at)
+            OR (o.id IS NULL))
+        insert into orders (SELECT *
+        FROM DATA);'''
+    
+    cursor.execute(q)
+    psycop_conn.commit()
 
     # final_data_to_be_pushed = pd.read_sql(q,con=conn)
     # print(final_data_to_be_pushed.head())
 
-    # q = '''with data as (SELECT distinct t.id as id
-    # FROM temp_orders AS t
-    # OUTER JOIN orders o ON o.id = t.id
-    # WHERE (t.first_name<>o.first_name)
-    # OR (t.last_name<>o.last_name)
-    # OR (t.mobile_no<>o.mobile_no)
-    # OR (t.created_at<>o.created_at)
-    # OR (o.id IS NULL) or (t.id is null))
-
-    # delete from orders where id in (select id from data);'''
-
-    # conn.execute(q)
-    # print('dropped modified columns from orders')
 
     # output = io.StringIO()
     # final_data_to_be_pushed.to_csv(output, sep='\t', header=False, index=False)
@@ -100,9 +134,9 @@ def push_data(df):
 
     print('data pushed into orders')
 
-    # q = '''drop table temp_orders;'''
-    # conn.execute(q)
-    # print('dropped the temp table')
+    q = '''drop table temp_orders;'''
+    conn.execute(q)
+    print('dropped the temp table')
 
 
 data = read_gsheet_data()
